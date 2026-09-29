@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 
+# =============================================================================
+# tor-gw
+#
+# A simple Linux Tor Gateway using Tor + iptables.
+#
+# Author : Arman Chahardoli
+# GitHub : https://github.com/arman-chahardoli/tor-gw
+#
+# =============================================================================
+
 set -euo pipefail
 
-VERSION="2.0"
+VERSION="1.0"
 
 SSH_PORT=22
 TOR_PORT=9040
@@ -12,112 +22,118 @@ STATE_DIR="/etc/tor-gw"
 STATE_FILE="$STATE_DIR/gw.conf"
 RULE_FILE="$STATE_DIR/firewall.rules"
 BACKUP_FILE="$STATE_DIR/firewall.backup"
-
-#######################################
-# Logging
-#######################################
+TORRC="/etc/tor/torrc"
+TORRC_BACKUP="${TORRC}.tor-gw.backup"
 
 GREEN='\033[0;32m'
+BRIGHT_GREEN='\033[1;92m'
 CYAN='\033[0;36m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-info(){
+info() {
     echo -e "${CYAN}[INFO]${NC} $1"
 }
 
-ok(){
+ok() {
     echo -e "${GREEN}[ OK ]${NC} $1"
 }
 
-fail(){
+fail() {
     echo -e "${RED}[FAIL]${NC} $1" >&2
     exit 1
 }
 
-#######################################
-# Root check
-#######################################
-
-require_root(){
+require_root() {
     [[ $EUID -eq 0 ]] || fail "Run as root"
 }
 
-#######################################
-# Dependency check
-#######################################
-
-check_dependencies(){
-
+check_dependencies() {
     info "Checking dependencies"
 
-    for cmd in ip iptables iptables-save iptables-restore awk grep tor; do
-        command -v "$cmd" >/dev/null ||
-        fail "$cmd not installed"
+    for cmd in \
+        ip \
+        iptables \
+        iptables-save \
+        iptables-restore \
+        awk \
+        grep \
+        sed \
+        tor \
+        systemctl \
+        sysctl
+    do
+        command -v "$cmd" >/dev/null 2>&1 ||
+            fail "$cmd not installed"
     done
 
-    [[ -f /etc/tor/torrc ]] ||
-    fail "/etc/tor/torrc not found"
+    [[ -f "$TORRC" ]] ||
+        fail "$TORRC not found"
 
     ok "Dependencies OK"
 }
 
-#######################################
-# Network detection
-#######################################
-
-detect_network(){
-
+detect_network() {
     info "Detecting network"
 
-    WAN_IFACE=$(ip route |
-        awk '/default/ {print $5; exit}')
+    WAN_IFACE=$(
+        ip route |
+            awk '/default/ {print $5; exit}'
+    )
 
-    WAN_GATEWAY=$(ip route |
-        awk '/default/ {print $3; exit}')
-
-    WAN_IP=$(ip -4 addr show "$WAN_IFACE" |
-        awk '/inet / {print $2}' |
-        cut -d/ -f1)
+    WAN_GATEWAY=$(
+        ip route |
+            awk '/default/ {print $3; exit}'
+    )
 
     [[ -n "$WAN_IFACE" ]] ||
-    fail "WAN interface not found"
+        fail "WAN interface not found"
 
-    LAN_IFACE=$(ip link |
-        awk -F': ' '{print $2}' |
-        grep -v lo |
-        grep -v "$WAN_IFACE" |
-        sed '/^$/d' |
-        head -1)
+    WAN_IP=$(
+        ip -4 addr show "$WAN_IFACE" |
+            awk '/inet / {print $2}' |
+            cut -d/ -f1 |
+            head -1
+    )
+
+    LAN_IFACE=$(
+        ip -o link show |
+            awk -F': ' '{print $2}' |
+            grep -v '^lo$' |
+            grep -v "^${WAN_IFACE}$" |
+            head -1
+    )
 
     [[ -n "$LAN_IFACE" ]] ||
-    fail "LAN interface not found"
+        fail "LAN interface not found"
 
-    LAN_IP=$(ip -4 addr show "$LAN_IFACE" |
-        awk '/inet / {print $2}' |
-        cut -d/ -f1)
+    LAN_IP=$(
+        ip -4 addr show "$LAN_IFACE" |
+            awk '/inet / {print $2}' |
+            cut -d/ -f1 |
+            head -1
+    )
 
-    LAN_NETWORK=$(ip route |
-        grep "$LAN_IFACE" |
-        awk '{print $1}' |
-        head -1)
+    LAN_NETWORK=$(
+        ip route |
+            awk -v iface="$LAN_IFACE" '$0 ~ iface {print $1; exit}'
+    )
+
+    [[ -n "$LAN_IP" ]] ||
+        fail "No IPv4 address found on $LAN_IFACE"
+
+    [[ -n "$LAN_NETWORK" ]] ||
+        fail "LAN network not found"
 
     ok "WAN detected: $WAN_IFACE"
     ok "LAN detected: $LAN_IFACE"
 }
 
-#######################################
-# Show configuration
-#######################################
-
-show_config(){
-
+show_config() {
     echo
-
-    echo "=============================="
+    echo "================================"
     echo " TOR-GW CONFIGURATION"
-    echo "=============================="
-
+    echo "================================"
     echo
 
     echo "WAN"
@@ -133,18 +149,18 @@ show_config(){
     echo " Network   : $LAN_NETWORK"
 
     echo
+
+    echo "Tor"
+    echo " TransPort : $TOR_PORT"
+    echo " DNSPort   : $DNS_PORT"
+
+    echo
 }
 
-#######################################
-# Save state
-#######################################
-
-save_state(){
-
+save_state() {
     mkdir -p "$STATE_DIR"
 
     cat > "$STATE_FILE" <<EOF
-
 WAN_IFACE=$WAN_IFACE
 WAN_IP=$WAN_IP
 WAN_GATEWAY=$WAN_GATEWAY
@@ -152,49 +168,29 @@ WAN_GATEWAY=$WAN_GATEWAY
 LAN_IFACE=$LAN_IFACE
 LAN_IP=$LAN_IP
 LAN_NETWORK=$LAN_NETWORK
-
 EOF
 
     ok "Configuration saved"
 }
 
-#######################################
-# Tor configuration
-#######################################
-
-configure_tor(){
-
-    local TORRC="/etc/tor/torrc"
-
+configure_tor() {
     info "Configuring Tor"
 
     [[ -f "$TORRC" ]] ||
-    fail "$TORRC not found"
+        fail "$TORRC not found"
 
-    # Backup torrc before modifying it
-    cp "$TORRC" "${TORRC}.backup"
+    if [[ ! -f "$TORRC_BACKUP" ]]; then
+        cp "$TORRC" "$TORRC_BACKUP"
+        ok "Original torrc backed up"
+    fi
 
-    # Remove existing managed settings
-    sed -i \
-        -e '/^RunAsDaemon[[:space:]]/d' \
-        -e '/^ClientOnly[[:space:]]/d' \
-        -e '/^VirtualAddrNetworkIPv4[[:space:]]/d' \
-        -e '/^AutomapHostsOnResolve[[:space:]]/d' \
-        -e '/^TransPort[[:space:]]/d' \
-        -e '/^DNSPort[[:space:]]/d' \
-        -e '/^SocksPort[[:space:]]/d' \
-        -e '/^SocksPolicy[[:space:]]/d' \
-        -e '/^ControlPort[[:space:]]/d' \
-        -e '/^CookieAuthentication[[:space:]]/d' \
-        -e '/^AvoidDiskWrites[[:space:]]/d' \
-        -e '/^Log notice file[[:space:]]/d' \
-        "$TORRC"
+    sed -i '/^[[:space:]]*#/! s/^/#/' "$TORRC"
 
-    cat >> "$TORRC" <<'EOF'
+    cat >> "$TORRC" <<EOF
 
-# ==========================================
+# =============================================================================
 # tor-gw configuration
-# ==========================================
+# =============================================================================
 
 RunAsDaemon 1
 
@@ -203,12 +199,12 @@ ClientOnly 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 AutomapHostsOnResolve 1
 
-TransPort 0.0.0.0:9040
-DNSPort 0.0.0.0:5353
+TransPort 0.0.0.0:${TOR_PORT}
+DNSPort 0.0.0.0:${DNS_PORT}
 
-SocksPort 127.0.0.1:9050
-SocksPolicy accept 127.0.0.1
-SocksPolicy reject *
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 0.0.0.0
+
 ControlPort 127.0.0.1:9051
 CookieAuthentication 1
 
@@ -217,19 +213,26 @@ Log notice file /var/log/tor/notices.log
 
 EOF
 
-    ok "Tor configuration updated"
+    info "Validating Tor configuration"
+
+    tor --verify-config -f "$TORRC" >/dev/null ||
+        fail "Tor configuration validation failed"
+
+    ok "Tor configuration valid"
+
+    systemctl restart tor ||
+        fail "Failed to restart Tor"
+
+    systemctl is-active --quiet tor ||
+        fail "Tor service is not running"
+
+    ok "Tor service restarted"
 }
 
-#######################################
-# Firewall generation
-#######################################
-
-generate_firewall(){
-
+generate_firewall() {
     mkdir -p "$STATE_DIR"
 
     cat > "$RULE_FILE" <<EOF
-
 *mangle
 
 :PREROUTING ACCEPT
@@ -239,53 +242,61 @@ generate_firewall(){
 :POSTROUTING ACCEPT
 
 -A FORWARD \
--p tcp \
--m tcp \
---tcp-flags SYN,RST SYN \
--j TCPMSS \
---clamp-mss-to-pmtu
+    -p tcp \
+    -m tcp \
+    --tcp-flags SYN,RST SYN \
+    -j TCPMSS \
+    --clamp-mss-to-pmtu
 
 COMMIT
 
 
 *filter
 
-:INPUT DROP
-:FORWARD DROP
+:INPUT ACCEPT
+:FORWARD ACCEPT
 :OUTPUT ACCEPT
+
+# -----------------------------------------------------------------------------
+# INPUT
+# -----------------------------------------------------------------------------
 
 # Local traffic
 -A INPUT \
--i lo \
--j ACCEPT
+    -i lo \
+    -j ACCEPT
 
 # Existing connections to the gateway
 -A INPUT \
--m conntrack \
---ctstate ESTABLISHED,RELATED \
--j ACCEPT
+    -m conntrack \
+    --ctstate ESTABLISHED,RELATED \
+    -j ACCEPT
 
 # SSH management access
 -A INPUT \
--p tcp \
---dport $SSH_PORT \
--j ACCEPT
+    -p tcp \
+    --dport $SSH_PORT \
+    -j ACCEPT
+
+# -----------------------------------------------------------------------------
+# FORWARD
+# -----------------------------------------------------------------------------
 
 # LAN -> WAN
 -A FORWARD \
--i $LAN_IFACE \
--o $WAN_IFACE \
--m conntrack \
---ctstate NEW,RELATED,ESTABLISHED \
--j ACCEPT
+    -i $LAN_IFACE \
+    -o $WAN_IFACE \
+    -m conntrack \
+    --ctstate NEW,RELATED,ESTABLISHED \
+    -j ACCEPT
 
 # WAN -> LAN: return traffic only
 -A FORWARD \
--i $WAN_IFACE \
--o $LAN_IFACE \
--m conntrack \
---ctstate RELATED,ESTABLISHED \
--j ACCEPT
+    -i $WAN_IFACE \
+    -o $LAN_IFACE \
+    -m conntrack \
+    --ctstate RELATED,ESTABLISHED \
+    -j ACCEPT
 
 COMMIT
 
@@ -297,71 +308,73 @@ COMMIT
 :OUTPUT ACCEPT
 :POSTROUTING ACCEPT
 
+# -----------------------------------------------------------------------------
+# PREROUTING
+# -----------------------------------------------------------------------------
+
 # Do not redirect SSH to Tor
 -A PREROUTING \
--i $LAN_IFACE \
--p tcp \
---dport $SSH_PORT \
--j RETURN
+    -i $LAN_IFACE \
+    -p tcp \
+    --dport $SSH_PORT \
+    -j RETURN
 
 # Do not redirect traffic destined for the gateway itself
 -A PREROUTING \
--d $LAN_IP \
--i $LAN_IFACE \
--j RETURN
+    -d $LAN_IP \
+    -i $LAN_IFACE \
+    -j RETURN
 
 # Force LAN DNS through local DNS resolver
 -A PREROUTING \
--i $LAN_IFACE \
--p udp \
---dport 53 \
--j REDIRECT \
---to-ports $DNS_PORT
+    -i $LAN_IFACE \
+    -p udp \
+    --dport 53 \
+    -j REDIRECT \
+    --to-ports $DNS_PORT
 
 -A PREROUTING \
--i $LAN_IFACE \
--p tcp \
---dport 53 \
--j REDIRECT \
---to-ports $DNS_PORT
+    -i $LAN_IFACE \
+    -p tcp \
+    --dport 53 \
+    -j REDIRECT \
+    --to-ports $DNS_PORT
 
 # Redirect new TCP connections to Tor
 -A PREROUTING \
--i $LAN_IFACE \
--p tcp \
--m conntrack \
---ctstate NEW \
--j REDIRECT \
---to-ports $TOR_PORT
+    -i $LAN_IFACE \
+    -p tcp \
+    -m conntrack \
+    --ctstate NEW \
+    -j REDIRECT \
+    --to-ports $TOR_PORT
+
+# -----------------------------------------------------------------------------
+# POSTROUTING
+# -----------------------------------------------------------------------------
 
 # NAT LAN traffic to WAN
 -A POSTROUTING \
--o $WAN_IFACE \
--j MASQUERADE
+    -o $WAN_IFACE \
+    -j MASQUERADE
 
 COMMIT
-
 EOF
 
     ok "Firewall generated"
 }
 
-#######################################
-# Validate
-#######################################
-
-validate_firewall(){
-
+validate_firewall() {
     info "Testing firewall"
 
     iptables-restore --test < "$RULE_FILE" ||
-    fail "Firewall syntax error"
+        fail "Firewall syntax error"
 
     ok "Firewall valid"
 }
 
 enable_ip_forwarding() {
-    info Enabling IPv4 forwarding
+    info "Enabling IPv4 forwarding"
 
     cat > /etc/sysctl.d/99-tor-gw.conf <<EOF
 net.ipv4.ip_forward = 1
@@ -369,29 +382,19 @@ EOF
 
     sysctl --system >/dev/null
 
-    if [ "$(sysctl -n net.ipv4.ip_forward)" = "1" ]; then
-        ok IPv4 forwarding enabled
+    if [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]]; then
+        ok "IPv4 forwarding enabled"
     else
-        fail Could not enable IPv4 forwarding
-
+        fail "Could not enable IPv4 forwarding"
     fi
 }
 
-#######################################
-# Apply
-#######################################
-
-apply_firewall(){
-
+apply_firewall() {
     info "Backing up current firewall"
 
-    {
-        iptables-save -t filter
-        iptables-save -t nat
-        iptables-save -t mangle
-        iptables-save -t raw
-        iptables-save -t security
-    } > "$BACKUP_FILE"
+    iptables-save > "$BACKUP_FILE"
+
+    ok "Current firewall backed up"
 
     info "Applying firewall"
 
@@ -400,53 +403,61 @@ apply_firewall(){
     ok "Firewall applied"
 }
 
-#######################################
-# Rollback
-#######################################
-
-rollback(){
-
+rollback() {
     [[ -f "$BACKUP_FILE" ]] ||
-    fail "No backup found"
+        fail "No firewall backup found"
+
+    info "Restoring previous firewall"
 
     iptables-restore < "$BACKUP_FILE"
 
     ok "Firewall restored"
+
+    if [[ -f "$TORRC_BACKUP" ]]; then
+        info "Restoring previous torrc"
+
+        cp "$TORRC_BACKUP" "$TORRC"
+
+        systemctl restart tor ||
+            fail "Failed to restart Tor after torrc restore"
+
+        ok "Tor configuration restored"
+    fi
 }
 
-#######################################
-# Status
-#######################################
+status() {
+    echo
+    echo "================================"
+    echo " TOR-GW STATUS"
+    echo "================================"
+    echo
 
-status(){
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE"
+    else
+        echo "Not configured"
+    fi
 
     echo
 
-    echo "TOR-GW STATUS"
+    if systemctl is-active --quiet tor; then
+        echo "Tor service : running"
+    else
+        echo "Tor service : stopped"
+    fi
 
     echo
-
-    [[ -f "$STATE_FILE" ]] &&
-    cat "$STATE_FILE" ||
-    echo "Not configured"
 }
 
-#######################################
-# Client-side help
-#######################################
-
-client_help(){
-
+client_help() {
     echo
-    echo "=============================="
+    echo "================================"
     echo " TOR-GW CLIENT SETUP"
-    echo "=============================="
-    echo
-
-    echo "Example:"
+    echo "================================"
     echo
 
     echo "1. Show interfaces:"
+    echo
     echo "   ip -br a"
     echo
     echo "   lo    UP  127.0.0.1/8 ..."
@@ -454,76 +465,61 @@ client_help(){
     echo "   eth1  UP  ${LAN_IP%.*}.<1-254> ..."
     echo
 
-    echo "2. Set TOR-GW as default route:"
+    echo "2. Set TOR-GW as the default route:"
+    echo
     echo "   ip route replace default via $LAN_IP dev eth1"
     echo
 
     echo "3. Verify:"
+    echo
     echo "   ip route"
     echo
     echo "   default via $LAN_IP dev eth1"
     echo
 
     echo "4. Test:"
+    echo
     echo "   ping -c 3 $LAN_IP"
     echo "   curl https://check.torproject.org/api/ip"
     echo
 }
 
-#######################################
-# Setup
-#######################################
-
-setup(){
-
+setup() {
     require_root
-
     check_dependencies
-
     detect_network
-
     show_config
 
     read -rp "Apply configuration? [Y/n] " answer
 
-    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
-
-        save_state
-
-        configure_tor
-
-        generate_firewall
-
-        validate_firewall
-
-        enable_ip_forwarding
-
-        apply_firewall
-
-        client_help
-
-    else
-
+    if [[ "$answer" =~ ^[Nn]$ ]]; then
         echo "Cancelled"
-
+        return
     fi
 
+    save_state
+    configure_tor
+    generate_firewall
+    validate_firewall
+    enable_ip_forwarding
+    apply_firewall
+
+    client_help
+
     echo
-    echo -e "\033[1;92m==============================\033[0m"
-    echo -e "\033[1;92m This machine is now a TOR-GW \033[0m"
-    echo -e "\033[1;92m \033[0m"
-    echo -e "\033[1;92m To restore the previous firewall:\033[0m"
-    echo -e "\033[1;92m ./tor-gw.sh rollback:\033[0m"
-    echo -e "\033[1;92m==============================\033[0m"
+    echo -e "${BRIGHT_GREEN}================================${NC}"
+    echo -e "${BRIGHT_GREEN} This machine is now a TOR-GW${NC}"
+    echo -e "${BRIGHT_GREEN}================================${NC}"
+    echo
+    echo -e "${BRIGHT_GREEN}To restore the previous configuration:${NC}"
+    echo -e "${BRIGHT_GREEN}  sudo ./tor-gw.sh rollback${NC}"
+    echo
+    echo "GitHub: https://github.com/arman-chahardoli/tor-gw"
+    echo "Author: Arman Chahardoli"
     echo
 }
 
-#######################################
-# Main
-#######################################
-
 case "${1:-}" in
-
     setup)
         setup
         ;;
@@ -550,15 +546,14 @@ tor-gw v$VERSION
 
 Usage:
 
- ./tor-gw.sh setup
+  sudo ./tor-gw.sh setup
+  sudo ./tor-gw.sh detect
+  sudo ./tor-gw.sh status
+  sudo ./tor-gw.sh rollback
 
- ./tor-gw.sh detect
-
- ./tor-gw.sh status
-
- ./tor-gw.sh rollback
+GitHub: https://github.com/arman-chahardoli/tor-gw
+Author: Arman Chahardoli
 
 EOF
         ;;
-
 esac

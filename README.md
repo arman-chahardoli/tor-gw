@@ -106,9 +106,9 @@ vagrant@tor-gw-vm:~$ sudo ./tor-gw.sh setup
 [ OK ] WAN detected: eth0
 [ OK ] LAN detected: eth1
 
-==============================
+================================
  TOR-GW CONFIGURATION
-==============================
+================================
 
 WAN
  Interface : eth0
@@ -120,47 +120,63 @@ LAN
  IP        : 192.168.56.127
  Network   : 192.168.56.0/24
 
+Tor
+ TransPort : 9040
+ DNSPort   : 5353
+
 Apply configuration? [Y/n]
 [ OK ] Configuration saved
 [INFO] Configuring Tor
-[ OK ] Tor configuration updated
+[INFO] Validating Tor configuration
+[ OK ] Tor configuration valid
+[ OK ] Tor service restarted
 [ OK ] Firewall generated
 [INFO] Testing firewall
 [ OK ] Firewall valid
+[INFO] Enabling IPv4 forwarding
+[ OK ] IPv4 forwarding enabled
 [INFO] Backing up current firewall
+[ OK ] Current firewall backed up
 [INFO] Applying firewall
 [ OK ] Firewall applied
 
-==============================
+================================
  TOR-GW CLIENT SETUP
-==============================
-
-Example:
+================================
 
 1. Show interfaces:
+
    ip -br a
 
    lo    UP  127.0.0.1/8 ...
    eth0  UP  10.0.2.15/24 ...
    eth1  UP  192.168.56.<1-254> ...
 
-2. Set TOR-GW as default route:
+2. Set TOR-GW as the default route:
+
    ip route replace default via 192.168.56.127 dev eth1
 
 3. Verify:
+
    ip route
 
    default via 192.168.56.127 dev eth1
 
 4. Test:
+
    ping -c 3 192.168.56.127
    curl https://check.torproject.org/api/ip
 
 
-==============================
+================================
  This machine is now a TOR-GW
+================================
 
- To restore the previous firewall:
- ./tor-gw rollback:
-==============================
+To restore the previous configuration:
+  sudo ./tor-gw.sh rollback
+
+GitHub: https://github.com/arman-chahardoli/tor-gw
+Author: Arman Chahardoli
+
+vagrant@tor-gw-vm:~$
 ```
